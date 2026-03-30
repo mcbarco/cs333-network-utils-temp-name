@@ -21,8 +21,52 @@ def main():
     print("flags:", packet.flag_bits)
     print("payload:", packet.payload)
 
+
+
+# write var to disk in binary format
+def to_bin(var):
+    # step 1: convert var to hex format
+    num = int(var).to_bytes(1, byteorder='big')
+    # step 2: write var in binary to file
+    with open("test.bin", "wb") as f:
+        f.write(num)
+
+
+# read binary file from memory 
+def from_bin():
+    # step 1: read from a binary file
+    f = open("test.bin", "rb")
+    bin = f.read()
+    f.close()
+    # step 2: convert binary to integer
+    return int.from_bytes(bin, byteorder='big')
+
+# convert ip address to binary and write to file
+def ip_to_file(ip):
+    with open("ip.bin", "wb") as f:
+        for num in ip.split('.'):
+            f.write(int(num).to_bytes(1, byteorder='big'))
+
+# read binary file and convert to ip address
+def file_to_ip():
+    with open("ip.bin", "rb") as f:
+        ip_bytes = f.read()
+        ip_parts = [str(int.from_bytes(ip_bytes[i:i+1], byteorder='big')) for i in range(4)]
+        return '.'.join(ip_parts)
+
 if __name__ == "__main__":
-    main()
+    # main()
+    # our implementation
+    ip = "197.168.0.1"
+    ip_split = ip.split('.')
+    for num in ip_split:
+        to_bin(num)
+        var = from_bin()
+        print(var)
+    
+    # professor inspired implementation
+    ip_to_file(ip)
+    print(file_to_ip())
 
 class Packet:
     # TODO: Implement the Packet class with appropriate attributes and methods
