@@ -1,82 +1,222 @@
-from tcp_parser import TCPPacketParser
+#!/usr/bin/env python3
+"""
+CS333 — Network Packet Builder
 
-def main():
-    print("Hello from cs333-network-utils-temp-name!")
-    fake_packet = (
-        b"\x30\x39"      # src port = 12345
-        b"\x00\x50"      # dst port = 80
-        b"\x12\x34\x56\x78"  # seq number
-        b"\x00\x00\x00\x00"  # ack number
-        b"\x50"          # data offset (5) << 4
-        b"\x02"          # flags (SYN)
-        b"\xfa\xf0"      # window size
-        b"\x00\x00"      # checksum (fake)
-        b"\x00\x00"      # urgent pointer
-        b"hello"         # payload
+Shows how binary network packets are built by hand, layer by layer:
+    Ethernet frame  →  IPv4 header  →  TCP / UDP / ICMP segment
+
+Run:  python main.py
+"""
+import socket
+import struct
+
+# ── Protocol constants ──────────────────────────────────────────────────────────
+ETHERTYPE_IPV4 = 0x0800
+PROTO_ICMP     = 1
+PROTO_TCP      = 6
+PROTO_UDP      = 17
+
+
+# ── Checksum (RFC 1071) ─────────────────────────────────────────────────────────
+def inet_checksum(data: bytes) -> int:
+    """Sum all 16-bit words, fold the carry bits, return the one's complement."""
+    if len(data) % 2:
+        data += b"\x00"
+    total = sum(struct.unpack_from("!H", data, i)[0] for i in range(0, len(data), 2))
+    total = (total >> 16) + (total & 0xFFFF)
+    total += total >> 16
+    return ~total & 0xFFFF
+
+
+# ── Layer 2 — Ethernet header (14 bytes) ────────────────────────────────────────
+def make_ethernet_header(dst_mac: str, src_mac: str) -> bytes:
+    """
+    Ethernet II header layout:
+      6 bytes  destination MAC
+      6 bytes  source MAC
+      2 bytes  EtherType  (0x0800 = IPv4)
+    """
+    dst = bytes(int(h, 16) for h in dst_mac.split(":"))
+    src = bytes(int(h, 16) for h in src_mac.split(":"))
+    return struct.pack("!6s6sH", dst, src, ETHERTYPE_IPV4)
+
+
+# ── Layer 3 — IPv4 header (20 bytes) ────────────────────────────────────────────
+def make_ipv4_header(src_ip: str, dst_ip: str, protocol: int, payload_len: int) -> bytes:
+    """
+    IPv4 header layout (no options):
+      1 byte   version (4) + IHL (5 → 20-byte header)
+      1 byte   DSCP / ECN
+      2 bytes  total length  (header + payload)
+      2 bytes  identification
+      2 bytes  flags + fragment offset
+      1 byte   TTL
+      1 byte   protocol  (TCP=6, UDP=17, ICMP=1)
+      2 bytes  checksum  (computed over header bytes)
+      4 bytes  source IP
+      4 bytes  destination IP
+    """
+    total_len = 20 + payload_len
+    header = struct.pack(
+        "!BBHHHBBH4s4s",
+        0x45,                        # version=4, IHL=5
+        0,                           # DSCP/ECN
+        total_len,
+        0x1234,                      # identification
+        0x4000,                      # DF flag set, no fragmentation
+        64,                          # TTL
+        protocol,
+        0,                           # checksum placeholder
+        socket.inet_aton(src_ip),
+        socket.inet_aton(dst_ip),
     )
-    
-    packet = TCPPacketParser(fake_packet)
-    print("source port:", packet.src_port)
-    print("destination port:", packet.dst_port)
-    print("flags:", packet.flag_bits)
-    print("payload:", packet.payload)
+    checksum = inet_checksum(header)
+    return header[:10] + struct.pack("!H", checksum) + header[12:]
 
 
+# ── Layer 4 — TCP segment ───────────────────────────────────────────────────────
+def make_tcp_segment(
+    src_ip: str,
+    dst_ip: str,
+    src_port: int,
+    dst_port: int,
+    seq: int = 1000,
+    ack: int = 0,
+    flags: int = 0x002,     # SYN by default
+    payload: bytes = b"",
+) -> bytes:
+    """
+    TCP header layout (20 bytes, no options):
+      2 bytes  source port
+      2 bytes  destination port
+      4 bytes  sequence number
+      4 bytes  acknowledgment number
+      2 bytes  data offset (high 4 bits) + flags (low 9 bits)
+      2 bytes  window size
+      2 bytes  checksum  (computed over pseudo-header + segment)
+      2 bytes  urgent pointer
 
-# write var to disk in binary format
-def to_bin(var):
-    # step 1: convert var to hex format
-    num = int(var).to_bytes(1, byteorder='big')
-    # step 2: write var in binary to file
-    with open("test.bin", "wb") as f:
-        f.write(num)
+    Common flags:  SYN=0x002  ACK=0x010  PSH=0x008  FIN=0x001  RST=0x004
+    """
+    data_off_flags = (5 << 12) | (flags & 0x1FF)   # data offset = 5 (20 bytes)
+    header = struct.pack(
+        "!HHIIHHHH",
+        src_port, dst_port,
+        seq, ack,
+        data_off_flags, 65535,   # window size
+        0, 0,                     # checksum placeholder, urgent pointer
+    )
+    # TCP checksum covers a pseudo-header + the full segment
+    pseudo = struct.pack(
+        "!4s4sBBH",
+        socket.inet_aton(src_ip), socket.inet_aton(dst_ip),
+        0, PROTO_TCP, len(header) + len(payload),
+    )
+    checksum = inet_checksum(pseudo + header + payload)
+    header = header[:16] + struct.pack("!H", checksum) + header[18:]
+    return header + payload
 
 
-# read binary file from memory 
-def from_bin():
-    # step 1: read from a binary file
-    f = open("test.bin", "rb")
-    bin = f.read()
-    f.close()
-    # step 2: convert binary to integer
-    return int.from_bytes(bin, byteorder='big')
+# ── Layer 4 — UDP datagram ──────────────────────────────────────────────────────
+def make_udp_datagram(
+    src_ip: str,
+    dst_ip: str,
+    src_port: int,
+    dst_port: int,
+    payload: bytes = b"",
+) -> bytes:
+    """
+    UDP header layout (8 bytes):
+      2 bytes  source port
+      2 bytes  destination port
+      2 bytes  length  (header + payload)
+      2 bytes  checksum
+    """
+    length = 8 + len(payload)
+    header = struct.pack("!HHHH", src_port, dst_port, length, 0)
+    pseudo = struct.pack(
+        "!4s4sBBH",
+        socket.inet_aton(src_ip), socket.inet_aton(dst_ip),
+        0, PROTO_UDP, length,
+    )
+    checksum = inet_checksum(pseudo + header + payload)
+    header = header[:6] + struct.pack("!H", checksum)
+    return header + payload
 
-# convert ip address to binary and write to file
-def ip_to_file(ip):
-    with open("ip.bin", "wb") as f:
-        for num in ip.split('.'):
-            f.write(int(num).to_bytes(1, byteorder='big'))
 
-# read binary file and convert to ip address
-def file_to_ip():
-    with open("ip.bin", "rb") as f:
-        ip_bytes = f.read()
-        ip_parts = [str(int.from_bytes(ip_bytes[i:i+1], byteorder='big')) for i in range(4)]
-        return '.'.join(ip_parts)
+# ── Layer 4 — ICMP Echo Request (ping) ─────────────────────────────────────────
+def make_icmp_echo(
+    identifier: int = 1,
+    sequence: int = 1,
+    payload: bytes = b"Hello CS333!",
+) -> bytes:
+    """
+    ICMP Echo Request layout (type 8, code 0):
+      1 byte   type        (8 = echo request)
+      1 byte   code        (0)
+      2 bytes  checksum    (computed over header + payload)
+      2 bytes  identifier
+      2 bytes  sequence number
+    """
+    header = struct.pack("!BBHHH", 8, 0, 0, identifier, sequence)
+    checksum = inet_checksum(header + payload)
+    header = header[:2] + struct.pack("!H", checksum) + header[4:]
+    return header + payload
 
+
+# ── Assemble a full frame ───────────────────────────────────────────────────────
+def build_frame(eth: bytes, ip: bytes, transport: bytes) -> bytes:
+    """Stack the three layers into one Ethernet frame."""
+    return eth + ip + transport
+
+
+# ── Hex dump helper ─────────────────────────────────────────────────────────────
+def hexdump(data: bytes, width: int = 16) -> None:
+    """Print bytes as: offset | hex | ASCII."""
+    for i in range(0, len(data), width):
+        chunk = data[i : i + width]
+        hex_part = " ".join(f"{b:02x}" for b in chunk)
+        asc_part = "".join(chr(b) if 32 <= b < 127 else "." for b in chunk)
+        print(f"  {i:04x}  {hex_part:<{width * 3}}  {asc_part}")
+
+
+# ── Demo ────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    # main()
-    # our implementation
-    ip = "197.168.0.1"
-    ip_split = ip.split('.')
-    for num in ip_split:
-        to_bin(num)
-        var = from_bin()
-        print(var)
-    
-    # professor inspired implementation
-    ip_to_file(ip)
-    print(file_to_ip())
+    SRC_IP  = "192.168.1.100"
+    DST_IP  = "10.0.0.1"
+    SRC_MAC = "aa:bb:cc:dd:ee:ff"
+    DST_MAC = "ff:ee:dd:cc:bb:aa"
 
-class Packet:
-    # TODO: Implement the Packet class with appropriate attributes and methods
-    def __init__(self, src_ip, dst_ip, src_port, dst_port, data):
-        self.src_ip = src_ip
-        self.dst_ip = dst_ip
-        self.src_port = src_port
-        self.dst_port = dst_port
+    # TCP SYN
+    print("=== TCP SYN packet ===")
+    tcp_seg = make_tcp_segment(SRC_IP, DST_IP, src_port=54321, dst_port=80, flags=0x002)
+    tcp_frame = build_frame(
+        make_ethernet_header(DST_MAC, SRC_MAC),
+        make_ipv4_header(SRC_IP, DST_IP, PROTO_TCP, len(tcp_seg)),
+        tcp_seg,
+    )
+    print(f"  {len(tcp_frame)} bytes  (14 Ethernet + 20 IPv4 + 20 TCP)")
+    hexdump(tcp_frame)
 
-        self.seq = 0x11111111 # sequence number
-        self.ack_seq = 0 # acknowledgment number
-        self.window = 64240 # window size
-        self.payload = data # payload data
+    # UDP
+    print("\n=== UDP packet ===")
+    payload = b"Hello, CS333!"
+    udp_seg = make_udp_datagram(SRC_IP, DST_IP, src_port=54321, dst_port=53, payload=payload)
+    udp_frame = build_frame(
+        make_ethernet_header(DST_MAC, SRC_MAC),
+        make_ipv4_header(SRC_IP, DST_IP, PROTO_UDP, len(udp_seg)),
+        udp_seg,
+    )
+    print(f"  {len(udp_frame)} bytes  (14 Ethernet + 20 IPv4 + 8 UDP + {len(payload)} payload)")
+    hexdump(udp_frame)
+
+    # ICMP Echo Request (ping)
+    print("\n=== ICMP Echo Request (ping) ===")
+    icmp_msg = make_icmp_echo()
+    icmp_frame = build_frame(
+        make_ethernet_header(DST_MAC, SRC_MAC),
+        make_ipv4_header(SRC_IP, DST_IP, PROTO_ICMP, len(icmp_msg)),
+        icmp_msg,
+    )
+    print(f"  {len(icmp_frame)} bytes  (14 Ethernet + 20 IPv4 + 8 ICMP + 12 payload)")
+    hexdump(icmp_frame)
